@@ -11,6 +11,7 @@ the browser without waiting on a slow later one.
 from __future__ import annotations
 
 import logging
+import base64
 import time
 from dataclasses import dataclass
 from typing import Iterator, Optional, Union
@@ -64,6 +65,9 @@ def stream_frames(
     shiftstack: bool = False,
     spectrotemporal: bool = False,
     report_progress: bool = False,
+    data_source: str = "irsa_live",
+    local_field=None,
+    source_note: str = "",
 ) -> Iterator[object]:
     """Yields EncodedFrame objects as groups complete, then (unless
     `analyze` is False) one final dict {"type": "analysis", ...} with the
@@ -109,6 +113,10 @@ def stream_frames(
         grid_scale_arcsec=cfg.pixel_scale_arcsec,
         native_scale_arcsec=cfg.native_pixel_scale_arcsec,
     )
+    # where the pixels come from (app/localdata.py); every frame and the analysis say so
+    grid.data_source = data_source
+    grid.local_field = local_field
+    grid.source_note = source_note
 
     groups_full = group_indices(records, mode=mode)
     # Cap *before* fetching, not after - the timing report showed ~97% of
@@ -233,6 +241,10 @@ class _GridContext:
         self.centre_dec = centre_dec
         self.grid_scale_arcsec = grid_scale_arcsec
         self.native_scale_arcsec = native_scale_arcsec
+        # where the pixels come from (app/localdata.py); set by stream_frames
+        self.data_source = "irsa_live"
+        self.local_field = None
+        self.source_note = ""
         # (series key, SeriesFrame) for every emitted frame, kept for the
         # end-of-stream analysis. Grids are small (a 5' field is 99x99).
         self.collected: list[tuple[str, SeriesFrame]] = []
@@ -368,25 +380,18 @@ def _combine_and_encode(
     # Fill small, isolated NaN holes FOR DISPLAY ONLY (see fill_small_gaps's
     # docstring). The filled pixel indices are sent to the client so the
     # readout can say "interpolated", and no measurement uses them.
-    #
-    # Likewise the shown image is combined from the exposures' display copies,
-    # in which Lanczos ringing around bright stars is clamped away (a black
-    # ring of negative brightness otherwise; app/resample.clamp_to_local_range).
-    # Same weights, same mask - only ringing pixels differ from `image`.
-    if any(m.display_image is not None for m in members):
-        display, _, _ = combine_inverse_variance(
-            [m.display_image if m.display_image is not None else m.image for m in members],
-            [m.variance for m in members],
-        )
-        both = np.isfinite(display) & np.isfinite(image)
-        scale = float(np.nanmax(np.abs(image[both]))) if both.any() else 0.0
-        n_ringing_clamped = int(np.count_nonzero(np.abs(display[both] - image[both]) > 1e-3 * scale)) if scale > 0 else 0
-    else:
-        display, n_ringing_clamped = image, 0
-    before_nan = ~np.isfinite(display)
-    image, n_gap_filled = fill_small_gaps(display)
+    before_nan = ~np.isfinite(image)
+    image, n_gap_filled = fill_small_gaps(image)
     filled_idx = np.flatnonzero(before_nan & np.isfinite(image))
     stats.combine_s += time.time() - t0
+
+    # Pixels built partly from saturated / non-linear native pixels in at
+    # least one combined exposure (pipeline.saturation_on_grid). Sent as a
+    # bit-packed mask so the client can refuse to colour them.
+    sat_mask = np.zeros(image.shape, dtype=bool)
+    for m in members:
+        if m.saturation is not None and m.saturation.shape == image.shape:
+            sat_mask |= m.saturation
 
     contamination: dict[str, int] = {}
     for m in members:
@@ -416,15 +421,19 @@ def _combine_and_encode(
         "n_groups": n_groups,
         "partial": partial,
         "n_gap_filled_pixels": n_gap_filled,
-        # Pixels whose shown value differs from the measured image by more than
-        # 0.1% of the frame's peak because resampling ringing was clamped.
-        "n_ringing_clamped_pixels": n_ringing_clamped,
         # Capped so a pathological frame can't bloat the stream; the count above is exact.
         "gap_filled_indices": filled_idx[:2000].tolist(),
         "photometry": phot_meta,
         "target_pixel": target_meta,
+        # Row-major over the grid, 1 bit per pixel, little-endian bit order
+        # (numpy.packbits(..., bitorder="little")).
+        "saturation_mask_b64": base64.b64encode(np.packbits(sat_mask.ravel(), bitorder="little").tobytes()).decode("ascii"),
+        "n_saturation_flagged_pixels": int(sat_mask.sum()),
     }
     if grid is not None:
+        extra["data_source"] = getattr(grid, "data_source", "irsa_live")
+        if getattr(grid, "source_note", ""):
+            extra["data_source_note"] = grid.source_note
         extra["grid_wcs"] = grid.wcs_metadata()
         extra["grid_centre_deg"] = [grid.centre_ra, grid.centre_dec]
         extra["grid_scale_arcsec"] = grid.grid_scale_arcsec
@@ -440,16 +449,45 @@ def run_analysis(grid: "_GridContext", fov_arcmin: float, mode: str) -> dict:
     # One cone per catalogue covers the whole square field (half-diagonal + margin).
     radius_deg = (fov_arcmin / 60.0) * 0.5 * 1.5
     catalog_errors = []
-    try:
-        gaia = gaia_sources(grid.centre_ra, grid.centre_dec, radius_deg)
-    except CatalogError as exc:
-        gaia = None
-        catalog_errors.append(str(exc))
-    try:
-        catwise = catwise_sources(grid.centre_ra, grid.centre_dec, radius_deg)
-    except CatalogError as exc:
-        catwise = None
-        catalog_errors.append(str(exc))
+    catalog_source = {}
+
+    def _query(fn, name):
+        """Live cone search, or the locally downloaded rows (app/localdata.py):
+        directly when the images are local too, as a fallback otherwise."""
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        from . import localdata
+
+        field = getattr(grid, "local_field", None)
+        if field is None and localdata.fallback_allowed():
+            field = localdata.field_for(SkyCoord(grid.centre_ra * u.deg, grid.centre_dec * u.deg))
+        use_local_first = field is not None and (getattr(grid, "data_source", "") == localdata.LOCAL
+                                                 or localdata.data_mode() == "cached")
+        if not use_local_first:
+            try:
+                rows = fn(grid.centre_ra, grid.centre_dec, radius_deg)
+                catalog_source[name] = localdata.LIVE
+                return rows
+            except CatalogError as exc:
+                if field is None or not localdata.fallback_allowed():
+                    catalog_errors.append(str(exc))
+                    return None
+                live_error = str(exc)
+        else:
+            live_error = None
+        try:
+            with localdata.local_catalogues(field):
+                rows = fn(grid.centre_ra, grid.centre_dec, radius_deg)
+            catalog_source[name] = localdata.LOCAL
+            if live_error:
+                catalog_errors.append(f"{live_error} (using the {name} rows downloaded for '{field.name}' on {field.retrieved} instead)")
+            return rows
+        except CatalogError as exc:
+            catalog_errors.append(f"{live_error + '; ' if live_error else ''}local {name} rows: {exc}")
+            return None
+
+    gaia = _query(gaia_sources, "gaia_dr3")
+    catwise = _query(catwise_sources, "catwise2020")
 
     by_series: dict[str, list[SeriesFrame]] = {}
     for key, frame in grid.collected:
@@ -473,6 +511,9 @@ def run_analysis(grid: "_GridContext", fov_arcmin: float, mode: str) -> dict:
         "type": "analysis",
         "grouping": mode,
         "catalog_errors": catalog_errors,
+        "catalog_source": catalog_source,
+        "data_source": getattr(grid, "data_source", "irsa_live"),
+        "data_source_note": getattr(grid, "source_note", ""),
         "statement": (
             "Automated measurements for human inspection. 'candidate' and 'unmatched' are not discovery claims; "
             "no object class is estimated."
