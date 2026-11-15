@@ -1,4 +1,4 @@
-# How to Run SPHEREx Blink
+# How to Run
 
 ## Requirements
 
