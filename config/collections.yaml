@@ -1,0 +1,106 @@
+# SPHEREx data sources. Update this file (or just rely on the runtime
+# discovery below) when IRSA ships a new release — nothing else in the
+# codebase should hard-code a release name. See PLAN.md Phase 0 finding #1.
+
+irsa:
+  base_url: "https://irsa.ipac.caltech.edu"
+  tap_endpoint: "/TAP"
+  # SIA is preferred for live/user-facing discovery (measured 3-6x faster
+  # than TAP, see PLAN.md). TAP is kept as a fallback for completeness.
+  sia_collection_prefix: "spherex"
+  # Known-good as of 2026-11-14; `backend/app/irsa.py:discover_collections()`
+  # re-derives this list at runtime and only falls back to these if the
+  # discovery call itself fails (e.g. IRSA is unreachable).
+  fallback_collections:
+    - spherex_dr1
+    - spherex_qr3
+  # Collections to EXCLUDE even if they match the prefix: pre-aggregated
+  # "cube" and "deep" products aren't individual-epoch exposures.
+  exclude_suffixes:
+    - "_cube"
+    - "_deep"
+
+simbad:
+  # Tried in order. Harvard confirmed live 2026-11-14; CDS is the
+  # astroquery default but was returning 404 on every path (see PLAN.md
+  # Phase 0 finding #7) — kept in the list in case it comes back.
+  tap_mirrors:
+    - "https://simbad.harvard.edu/simbad/sim-tap"
+    - "https://simbad.cds.unistra.fr/simbad/sim-tap"
+
+quality:
+  # Max exposures fetched *per group* (epoch, or epoch+detector in
+  # detector_epoch mode) - capped before fetching, not after, since the
+  # fetch itself is ~97% of request time (see app/stream.py's timing
+  # report). Evenly spaced across the group, so the full time baseline is
+  # kept either way; only the S/N of the stack changes. 0/null = no cap
+  # (today's full-quality behaviour).
+  low: 5
+  mid: 15
+  high: 0
+  default: mid
+
+detectors:
+  # D1..D6, linear variable filters (see SPHEREx_tool_prompt.md). Default
+  # subset for a new query — chosen for speed, user can add more.
+  # NB: frames are grouped per detector by default (docs/AUDIT.md C1);
+  # selecting two detectors gives two independent image series.
+  all: [D1, D2, D3, D4, D5, D6]
+  default: [D6, D2]
+  wavelength_um:
+    D1: [0.75, 1.09]
+    D2: [1.10, 1.62]
+    D3: [1.63, 2.41]
+    D4: [2.42, 3.82]
+    D5: [3.83, 4.41]
+    D6: [4.42, 5.00]
+
+fov:
+  default_arcmin: 5
+  min_arcmin: 1
+  max_arcmin: 30
+  warn_above_arcmin: 15
+
+fetch:
+  max_workers: 10
+  global_concurrency_cap: 24
+  connect_timeout_s: 10
+  read_timeout_s: 30
+  max_retries: 4
+  backoff_base_s: 2
+  retry_status_codes: [503, 502, 504]
+
+# The real native SPHEREx pixel scale is 6.15"/px (confirmed directly from
+# IRSA's own SIA metadata, s_pixel_scale). A teammate's independent
+# "planet-x" renderer (phase1/common.py) outputs onto a grid at exactly
+# half that (3.075"/px) - this doesn't add real resolution (the native
+# data is still 6.15"/px either way), it's oversampling onto a finer
+# display grid for a smoother, less blocky zoomed look. Matched here so
+# our output looks comparably fine-grained; app/pipeline.py's
+# reproject_nearest (nearest-neighbour) just repeats each native pixel's
+# value across the ~4 output pixels it now covers, honouring NaN masks
+# exactly either way - no blending, no new information, just smaller
+# on-screen squares.
+pixel_scale_arcsec: 3.075
+
+# Native SPHEREx detector pixel (IRSA SIA s_pixel_scale, verified 2026-11-15).
+# Used to correct photometric errors for the pixel duplication that
+# nearest-neighbour resampling onto the finer grid above introduces.
+native_pixel_scale_arcsec: 6.15
+
+spectrum:
+  # /api/spectrum used to download EVERY exposure (~190 x 4 MB at Barnard's
+  # Star). This caps it, spread evenly in time within each detector.
+  max_exposures: 60
+
+resampling:
+  # How each exposure is put on the common grid: nearest | bilinear | lanczos3.
+  # Chosen on scripts/benchmark_resampling.py (docs/PHASE2.md,
+  # docs/data/resampling_benchmark.json), not on looks.
+  kernel: lanczos3
+  # Resampled pixels are correlated, so the error of an aperture sum is
+  # larger than the per-pixel variances suggest. Measured factors (r = 9"):
+  aperture_variance_inflation:
+    nearest: 3.8
+    bilinear: 7.2
+    lanczos3: 5.0

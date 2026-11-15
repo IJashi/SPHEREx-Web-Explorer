@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPHEREx Blink</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Almendra:ital,wght@0,400;0,700;1,400&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- The sky is the world; the interface is a set of game-menu windows laid
+     over it, one per screen edge. A window shows while the cursor is near
+     its edge, while it is pinned, or in "menu mode" (right-click the sky).
+     See ui_chrome.js. -->
+<main id="stage">
+  <canvas id="viewer-canvas" width="400" height="400"></canvas>
+  <!-- Markers drawn over the image at screen resolution (tracked sources,
+       shift-and-stack candidates); the image canvas itself holds one pixel
+       per grid pixel and is only scaled by CSS. -->
+  <canvas id="overlay-canvas" aria-hidden="true"></canvas>
+  <div id="crosshair" hidden aria-hidden="true"></div>
+  <div id="compass" hidden aria-hidden="true">N ↑&ensp;E ←</div>
+  <div id="empty-state" class="empty-state window">Enter a position above (try "Barnard's star", "WISE J085510.83-071442.5", or "269.452 4.693") and press Go.
+
+For typed coordinates the app asks CatWISE2020 whether a known fast mover passed through them, and otherwise treats them as fixed. Entering a fast-moving object's name is more reliable (WISE 0855 is now about 2′ from its 2010 coordinates).</div>
+</main>
+
+<div id="pixel-readout" class="pixel-readout"></div>
+
+<div id="progress-wrap" hidden>
+  <div id="progress-bar"></div>
+  <span id="progress-text"></span>
+  <button type="button" id="progress-action" hidden>Stop</button>
+</div>
+
+<header class="dock dock-top" data-edge="top">
+  <form id="search-form" class="search-bar window">
+    <input id="position-input" type="text" placeholder="RA/Dec (08h55m10.8s -07d14m42.5s or 269.452 4.693) or an object name" autocomplete="off" aria-label="Sky position or object name">
+    <button type="submit" id="go-btn" class="text-btn">Go</button>
+  </form>
+  <p id="resolve-status" class="status-text"></p>
+</header>
+
+<aside class="dock dock-left window" data-edge="left" id="controls">
+  <div class="titlebar">
+    <h1 class="title">SPHEREx Blink</h1>
+    <button type="button" class="pin-btn" data-pin="left" aria-pressed="false" title="Keep this window open" aria-label="Keep this window open"></button>
+  </div>
+  <div class="window-body">
+    <p class="status-text intro">Blink NASA SPHEREx epochs at any sky position to spot moving or variable objects. Inspired by <a href="http://byw.tools/wiseview" target="_blank" rel="noopener">WiseView</a>.</p>
+
+    <section>
+      <h2>Search area</h2>
+      <label>Field of view <span id="fov-value">5′</span>
+        <input id="fov-slider" type="range" min="1" max="30" step="0.5" value="5">
+      </label>
+      <p id="fov-warning" class="warning" hidden>Large field of view. This will be slower.</p>
+
+      <label>Grouping
+        <select id="mode-select">
+          <option value="detector_epoch" selected>Per detector per survey epoch (default)</option>
+          <option value="single">Every exposure</option>
+          <option value="epoch">All detectors stacked (display only, mixes wavelengths)</option>
+        </select>
+      </label>
+
+      <fieldset id="detector-fieldset">
+        <legend>Detectors</legend>
+        <label><input type="checkbox" value="D1"><b>D1</b> 0.75–1.09 µm</label>
+        <label><input type="checkbox" value="D2" checked><b>D2</b> 1.10–1.62 µm</label>
+        <label><input type="checkbox" value="D3"><b>D3</b> 1.63–2.41 µm</label>
+        <label><input type="checkbox" value="D4"><b>D4</b> 2.42–3.82 µm</label>
+        <label><input type="checkbox" value="D5"><b>D5</b> 3.83–4.41 µm</label>
+        <label><input type="checkbox" value="D6" checked><b>D6</b> 4.42–5.00 µm</label>
+      </fieldset>
+
+      <label class="check" title="Searches every fetched exposure for faint sources moving along a straight line, with time-shuffled control searches. Adds roughly 10-30 s per detector after the frames arrive."><input id="shiftstack-checkbox" type="checkbox"> Shift-and-stack search (slower)</label>
+      <label class="check" title="Measures every fetched exposure on its own pixels, at its own wavelength and time, for the target and the tracked sources: F(lambda, t). Adds a few seconds to a minute after the frames arrive."><input id="st-checkbox" type="checkbox"> Spectro-temporal analysis F(λ, t)</label>
+      <label>Quality <span id="quality-value">Mid (balanced)</span>
+        <input id="quality-slider" type="range" min="0" max="2" value="1" step="1">
+      </label>
+      <p class="status-text">Caps exposures combined per epoch (fewer = faster to fetch, slightly noisier). Low is about 5, Mid about 15, High is all available, spread evenly across the epoch's time span either way.</p>
+    </section>
+
+    <section>
+      <h2>Compare</h2>
+      <label>View
+        <select id="view-mode-select">
+          <option value="blink" selected>Blink</option>
+          <option value="difference">Difference (B − A)</option>
+          <option value="sum">Mean of all epochs</option>
+          <option value="shiftstack">Shift-and-stack S/N map</option>
+        </select>
+      </label>
+      <div id="ab-pick" hidden>
+        <label>Frame A <input id="diff-a-slider" type="range" min="0" max="0" value="0"></label>
+        <label>Frame B <input id="diff-b-slider" type="range" min="0" max="0" value="0"></label>
+      </div>
+      <p id="contamination-summary" class="status-text"></p>
+      <p class="status-text">Differences are not PSF-matched and use nearest-pixel alignment: bright <em>stationary</em> stars also leave residuals. Compare a candidate with its neighbours before reading anything into it.</p>
+    </section>
+
+    <section>
+      <h2>Display</h2>
+      <label>Stretch
+        <select id="stretch-select">
+          <option value="linear">Linear</option>
+          <option value="asinh" selected>Asinh (planet-x renderer)</option>
+          <option value="zscale">Zscale-like</option>
+        </select>
+      </label>
+      <label>Black point <span id="black-value"></span>
+        <input id="black-slider" type="range" min="0" max="100" value="1" step="0.5">
+      </label>
+      <label>White point <span id="white-value"></span>
+        <input id="white-slider" type="range" min="0" max="100" value="99" step="0.5">
+      </label>
+      <p id="asinh-note" class="status-text" hidden>Asinh uses fixed levels (median / 99.8th percentile, computed across the whole loaded sequence). The black and white sliders are inactive in this mode.</p>
+      <label>Zoom <span id="zoom-value">1×</span>
+        <input id="zoom-slider" type="range" min="1" max="8" value="1" step="0.25">
+      </label>
+      <label class="check"><input id="fill-checkbox" type="checkbox"> Fill the screen (crops the field)</label>
+      <label class="check"><input id="invert-checkbox" type="checkbox"> Invert</label>
+    </section>
+  </div>
+</aside>
+
+<aside class="dock dock-right window" data-edge="right">
+  <div class="titlebar">
+    <h2 class="title">Measurements</h2>
+    <button type="button" class="pin-btn" data-pin="right" aria-pressed="false" title="Keep this window open" aria-label="Keep this window open"></button>
+  </div>
+  <div class="window-body">
+    <section>
+      <h2>Light curve</h2>
+      <div class="plot-box"><canvas id="lightcurve-canvas" width="288" height="120"></canvas></div>
+      <p class="status-text">Aperture flux at the target's predicted position per frame, mJy ±1σ, for the detector shown. Hollow markers: measurement refused (masked, saturated or off-image). Error bars are statistical only: frames of a constant star differ by about 3–5% (measured on field stars). Each frame also samples a different wavelength within the detector (see λ in the frame label), so differences can be spectral rather than variability.</p>
+    </section>
+
+    <section>
+      <h2>Spectrum</h2>
+      <div class="plot-box"><canvas id="spectrum-canvas" width="288" height="120"></canvas></div>
+      <p id="spectrum-status" class="status-text"></p>
+      <p class="status-text">Click in the image for aperture flux (mJy, ±1σ, r = 9″, no aperture correction) vs wavelength, across all 6 detectors. Clicking on the crosshair of a proper-motion target follows its motion per exposure. Points are coloured by date. SPHEREx does not see all wavelengths at once, so a variable star's points from different dates are not one spectrum. Slow: it re-queries IRSA. Compare with IRSA's <a href="https://irsa.ipac.caltech.edu/applications/spherex/tool-spectrophotometry" target="_blank" rel="noopener">official Spectrophotometry Tool</a>.</p>
+    </section>
+
+    <section>
+      <h2>Share</h2>
+      <label>Link <input id="share-url" type="text" readonly></label>
+      <label>Embed <textarea id="embed-snippet" readonly rows="2"></textarea></label>
+    </section>
+
+    <section>
+      <h2>Cache</h2>
+      <p id="cache-status" class="status-text">—</p>
+      <button type="button" id="clear-cache-btn" class="text-btn">Clear cache</button>
+    </section>
+
+    <p class="credits status-text">Data: NASA/IPAC Infrared Science Archive (IRSA), SPHEREx mission. Name resolution: SIMBAD, CDS Strasbourg.
+    Catalogues: Gaia DR3, CatWISE2020. This tool fetches public SPHEREx cutouts live from IRSA and stores no images
+    server-side (only ranked sources and volunteer classifications); your browser caches recently viewed frames
+    locally purely to make repeat views faster.</p>
+  </div>
+</aside>
+
+<footer class="dock dock-bottom" data-edge="bottom">
+  <div id="frame-label" class="frame-label window"></div>
+  <div class="playback-bar window">
+    <button type="button" id="step-back-btn" class="icon-btn" title="Previous frame (←)">⏮</button>
+    <button type="button" id="play-btn" class="icon-btn play" title="Play/Pause (space)">▶</button>
+    <button type="button" id="step-fwd-btn" class="icon-btn" title="Next frame (→)">⏭</button>
+    <input id="frame-slider" type="range" min="0" max="0" value="0" aria-label="Frame">
+    <label title="Frames from different detectors are different wavelengths, so one detector series is shown at a time">Detector <select id="detector-view-select"></select></label>
+    <label>Speed <input id="speed-slider" type="range" min="1" max="10" value="4"></label>
+    <label class="check"><input id="loop-checkbox" type="checkbox" checked> Loop</label>
+    <label class="check"><input id="ab-checkbox" type="checkbox"> A/B flip</label>
+    <button type="button" id="sources-btn" class="text-btn" data-toggle-window="sources" aria-pressed="false" aria-controls="sources-window" title="Open or close the tracked sources window">Sources</button>
+    <button type="button" id="spectro-btn" class="text-btn" data-toggle-window="spectro" aria-pressed="false" aria-controls="st-window" title="Open or close the spectro-temporal analysis window">Spectra</button>
+    <button type="button" id="fullscreen-btn" class="icon-btn" title="Full screen" aria-label="Full screen"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" aria-hidden="true"><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/></svg></button>
+    <button type="button" class="pin-btn" data-pin="bottom" aria-pressed="false" title="Keep this bar open" aria-label="Keep this bar open"></button>
+  </div>
+</footer>
+
+<!-- Floating windows. Unlike the four edge windows these are opened on
+     request (buttons in the bottom bar), can be dragged by their title bar
+     and resized from any edge or corner, and remember where they were put
+     (ui_chrome.js). Their content is split into tabs so that each table or
+     plot gets the whole window. -->
+
+<!-- Tracked sources: detection, tracking, catalogue comparison and ranking
+     for the detector shown, plus volunteer classification. -->
+<section id="sources-window" class="window float-window" data-window="sources" aria-label="Tracked sources">
+  <div class="titlebar" data-drag>
+    <h2 class="title">Tracked sources</h2>
+    <button type="button" class="pin-btn close-btn" data-close title="Close this window (Esc)" aria-label="Close this window"></button>
+  </div>
+  <div class="window-body">
+    <div class="tab-row">
+      <button type="button" class="tab-btn" data-tab="sources-tab-table" aria-selected="true">Ranked sources</button>
+      <button type="button" class="tab-btn" data-tab="sources-tab-shiftstack" aria-selected="false">Shift-and-stack</button>
+      <span class="tab-gap"></span>
+      <label class="check"><input id="show-tracks-checkbox" type="checkbox" checked> Mark on the image</label>
+      <button type="button" id="export-json-btn" class="text-btn" disabled>Export JSON</button>
+      <button type="button" id="export-csv-btn" class="text-btn" disabled>Export CSV</button>
+    </div>
+    <div class="tab-pane" id="sources-tab-table">
+      <p id="analysis-status" class="status-text"></p>
+      <div class="sources-columns">
+        <div class="analysis-table-scroll">
+          <table class="analysis-table">
+            <thead>
+              <tr>
+                <th>#</th><th title="catalogued = uniquely matched to Gaia/CatWISE; candidate = worth a look; uncertain = measurement not trustworthy">Status</th>
+                <th title="0-1, weighted motion + variability + missing catalogue counterpart. Not a probability.">Anomaly</th>
+                <th title="How far the measurement itself can be trusted">Reliability</th>
+                <th title="Median detection signal-to-noise">S/N</th><th>Epochs</th><th>Proper motion</th>
+                <th title="Probability of the measured scatter if the flux were constant (6% systematic error included)">Variability</th>
+                <th>Catalogues</th><th>RA, Dec (deg)</th>
+              </tr>
+            </thead>
+            <tbody id="analysis-table-body"></tbody>
+          </table>
+        </div>
+        <div id="analysis-detail" class="analysis-detail"></div>
+      </div>
+    </div>
+    <div class="tab-pane" id="sources-tab-shiftstack" hidden>
+      <div id="shiftstack-panel" class="shiftstack-panel"></div>
+    </div>
+  </div>
+</section>
+
+<!-- Spectro-temporal analysis F(lambda, t): measured flux per exposure, each
+     at its own wavelength and time (Phase Three, app/spectrotemporal.py). -->
+<section id="st-window" class="window float-window" data-window="spectro" aria-label="Spectro-temporal analysis">
+  <div class="titlebar" data-drag>
+    <h2 class="title">Spectro-temporal analysis F(λ, t)</h2>
+    <button type="button" class="pin-btn close-btn" data-close title="Close this window (Esc)" aria-label="Close this window"></button>
+  </div>
+  <div class="window-body" id="st-panel">
+    <p id="st-status" class="status-text"></p>
+    <div id="st-body" hidden>
+      <div class="tab-row">
+        <label class="inline">Source <select id="st-source-select"></select></label>
+        <span class="tab-gap"></span>
+        <button type="button" class="tab-btn" data-tab="st-tab-sed" aria-selected="true">Spectrum by epoch</button>
+        <button type="button" class="tab-btn" data-tab="st-tab-lc" aria-selected="false">Light curves</button>
+        <button type="button" class="tab-btn" data-tab="st-tab-metrics" aria-selected="false">Change statistics</button>
+        <button type="button" class="tab-btn" data-tab="st-tab-coverage" aria-selected="false">Coverage</button>
+        <button type="button" class="tab-btn" data-tab="st-tab-table" aria-selected="false">All measurements</button>
+      </div>
+      <div class="tab-pane" id="st-tab-sed">
+        <div id="st-epoch-boxes" class="st-epoch-boxes"></div>
+        <div class="plot-box plot-fill"><canvas id="st-sed-canvas" width="900" height="260"></canvas></div>
+        <p id="st-hover" class="status-text">Hover a point to see its measurement.</p>
+        <p class="status-text">F<sub>ν</sub> in mJy (r = 9″ aperture, not aperture-corrected). One panel per detector: the gap between detectors is not observed. Filled = valid; hollow = valid but a saturation-related flag is in the aperture; arrow = 3σ upper limit; × on the baseline = no flux (red: saturated). Coloured bars under each panel: wavelengths actually sampled per epoch. Points of one epoch were taken over several days; only dichroic pairs (D1/D4, D2/D5, D3/D6) are simultaneous. No line is drawn between points.</p>
+      </div>
+      <div class="tab-pane" id="st-tab-lc" hidden>
+        <div class="plot-box plot-fill"><canvas id="st-lc-canvas" width="900" height="240"></canvas></div>
+      </div>
+      <div class="tab-pane" id="st-tab-metrics" hidden>
+        <p class="status-text">Each statistic is a test against "no change" with the stated errors (statistical + a 2.5 % per-exposure systematic floor measured on field stars), compared with stationary field stars in the same field when there are enough. A p-value is not the probability that the source is variable; "significant" describes the measurement, not its physical cause.</p>
+        <div id="st-metrics"></div>
+      </div>
+      <div class="tab-pane" id="st-tab-coverage" hidden>
+        <div id="st-coverage" class="analysis-table-scroll"></div>
+      </div>
+      <div class="tab-pane" id="st-tab-table" hidden>
+        <div class="analysis-table-scroll">
+          <table class="analysis-table">
+            <thead><tr><th>Date</th><th>MJD (mid)</th><th>Epoch</th><th>obs_id</th><th>Det</th><th>λ (µm)</th><th>Bandwidth (µm)</th><th>F (mJy)</th><th>σ (mJy)</th><th>S/N</th><th>3σ limit (mJy)</th><th>State</th><th>Flags in aperture</th></tr></thead>
+            <tbody id="st-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div id="edge-hint" class="window" hidden>Move the cursor to an edge of the screen for its window. Right-click the sky to open them all.</div>
+<button type="button" id="chrome-toggle" class="icon-btn" title="Open or close the menus" aria-label="Open or close the menus">☰</button>
+
+<script src="idb_cache.js"></script>
+<script src="app.js"></script>
+<script src="ui_chrome.js"></script>
+</body>
+</html>
